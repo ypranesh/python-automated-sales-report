@@ -1,0 +1,423 @@
+# ═══════════════════════════════════════════════════════════════
+# weekly_report.py
+# Automated Weekly Sales Report — Online Retail II
+# Runs standalone: python weekly_report.py
+# ═══════════════════════════════════════════════════════════════
+
+import os
+import sys
+import warnings
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from fpdf import FPDF
+from datetime import datetime
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from statsmodels.tsa.seasonal import seasonal_decompose
+
+warnings.filterwarnings('ignore')
+pd.set_option('display.float_format', '{:.2f}'.format)
+
+# ── CONFIG ───────────────────────────────────────────────────
+DATA_PATH   = r"C:\Users\prane\Desktop\Portfolio\Python\online_retail_II.xlsx"
+OUTPUT_PATH = r"C:\Users\prane\Desktop\Portfolio\Python"
+
+# ── COLOURS ──────────────────────────────────────────────────
+NAVY  = (15,  52,  96)
+RED   = (232, 72,  85)
+GREEN = (39, 174,  96)
+LGREY = (245, 247, 255)
+DGREY = (100, 100, 100)
+WHITE = (255, 255, 255)
+BLACK = (0,   0,   0)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 1 — LOAD & CLEAN DATA
+# ═══════════════════════════════════════════════════════════════
+print("Loading data...")
+
+df_09 = pd.read_excel(DATA_PATH, sheet_name='Year 2009-2010', engine='openpyxl')
+df_10 = pd.read_excel(DATA_PATH, sheet_name='Year 2010-2011', engine='openpyxl')
+df    = pd.concat([df_09, df_10], ignore_index=True)
+
+# Remove cancellations
+df = df[~df['Invoice'].astype(str).str.startswith('C')].copy()
+
+# Remove bad rows
+df = df[df['Customer ID'].notna()].copy()
+df = df[df['Quantity'] > 0].copy()
+df = df[df['Price'] > 0].copy()
+
+# Feature engineering
+df['Revenue']     = df['Quantity'] * df['Price']
+df['InvoiceDate'] = pd.to_datetime(df['InvoiceDate'])
+df['YearWeek']    = df['InvoiceDate'].dt.strftime('%G-W%V')
+
+print(f"Clean rows: {len(df):,}")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 2 — WEEKLY METRICS
+# ═══════════════════════════════════════════════════════════════
+print("Building weekly metrics...")
+
+weekly = (
+    df.groupby('YearWeek')
+    .agg(
+        Revenue   = ('Revenue',     'sum'),
+        Orders    = ('Invoice',     'nunique'),
+        Customers = ('Customer ID', 'nunique'),
+        Items_Sold= ('Quantity',    'sum')
+    )
+    .reset_index()
+    .sort_values('YearWeek')
+    .reset_index(drop=True)
+)
+weekly['AOV'] = weekly['Revenue'] / weekly['Orders']
+
+last_week = weekly.iloc[-2]
+prev_week = weekly.iloc[-3]
+
+# Top products
+top_products = (
+    df.groupby(['StockCode', 'Description'])
+    .agg(Revenue=('Revenue','sum'), Units_Sold=('Quantity','sum'),
+         Orders=('Invoice','nunique'))
+    .reset_index()
+    .sort_values('Revenue', ascending=False)
+    .head(10)
+)
+top_products['Avg_Price'] = (top_products['Revenue'] /
+                              top_products['Units_Sold'])
+top_products['Description'] = (
+    top_products['Description']
+    .astype(str)
+    .str.replace('—', '-').str.replace('–', '-')
+    .str.encode('latin-1', errors='replace')
+    .str.decode('latin-1')
+)
+
+# Top countries ex UK
+top_countries_ex_uk = (
+    df[df['Country'] != 'United Kingdom']
+    .groupby('Country')['Revenue']
+    .sum()
+    .sort_values(ascending=False)
+    .head(10)
+    .reset_index()
+)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 3 — FORECAST
+# ═══════════════════════════════════════════════════════════════
+print("Running forecast...")
+
+forecast_df = (
+    weekly[['YearWeek', 'Revenue']].copy()
+    .sort_values('YearWeek').reset_index(drop=True)
+)
+forecast_df['ds'] = pd.to_datetime(
+    forecast_df['YearWeek'].str.replace('W', '') + '-1',
+    format='%G-%V-%u'
+)
+forecast_df = (
+    forecast_df.set_index('ds')['Revenue']
+    .resample('W-MON').sum()
+    .iloc[:-2]
+)
+
+model = ExponentialSmoothing(
+    forecast_df, trend='add', seasonal=None
+).fit(optimized=True)
+
+forecast_values = model.forecast(8)
+forecast_dates  = forecast_values.index
+forecast_out    = pd.DataFrame({
+    'Week'    : forecast_dates.strftime('%G-W%V'),
+    'Forecast': forecast_values.values.round(2)
+})
+forecast_avg = forecast_out['Forecast'].mean()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 4 — GENERATE CHARTS
+# ═══════════════════════════════════════════════════════════════
+print("Generating charts...")
+
+# Chart 1 - Weekly Revenue
+fig, ax = plt.subplots(figsize=(7, 2.5))
+recent = weekly.tail(26)
+ax.fill_between(range(len(recent)), recent['Revenue'],
+                alpha=0.3, color='#2E86AB')
+ax.plot(range(len(recent)), recent['Revenue'],
+        color='#2E86AB', linewidth=1.5)
+ax.plot(range(len(recent)), recent['Revenue'].rolling(4).mean(),
+        color='#E84855', linewidth=1.5, linestyle='--', label='4-week MA')
+ax.set_xticks(range(0, len(recent), 4))
+ax.set_xticklabels(recent['YearWeek'].iloc[::4],
+                    rotation=45, ha='right', fontsize=7)
+ax.yaxis.set_major_formatter(
+    mticker.FuncFormatter(lambda x, _: f'£{x/1000:.0f}K'))
+ax.legend(fontsize=8)
+ax.set_title('Weekly Revenue - Last 26 Weeks', fontsize=10)
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_PATH, 'report_revenue.png'),
+            dpi=150, bbox_inches='tight')
+plt.close()
+
+# Chart 2 - Forecast
+fig, ax = plt.subplots(figsize=(7, 2.5))
+ax.bar(range(8), forecast_values.values, color='#E84855', alpha=0.8)
+ax.set_xticks(range(8))
+ax.set_xticklabels(forecast_dates.strftime('%G-W%V'),
+                    rotation=45, ha='right', fontsize=7)
+ax.yaxis.set_major_formatter(
+    mticker.FuncFormatter(lambda x, _: f'£{x/1000:.0f}K'))
+ax.set_title('8-Week Revenue Forecast', fontsize=10)
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_PATH, 'report_forecast.png'),
+            dpi=150, bbox_inches='tight')
+plt.close()
+
+# Chart 3 - Top products
+fig, ax = plt.subplots(figsize=(7, 3))
+top10 = top_products.head(10)
+ax.barh(range(10), top10['Revenue'].values[::-1],
+        color='#27AE60', alpha=0.85)
+ax.set_yticks(range(10))
+ax.set_yticklabels(
+    [str(d)[:30] if isinstance(d, str)
+     else 'Unknown' for d in top10['Description'].values[::-1]],
+    fontsize=7)
+ax.xaxis.set_major_formatter(
+    mticker.FuncFormatter(lambda x, _: f'£{x/1000:.0f}K'))
+ax.set_title('Top 10 Products by Revenue', fontsize=10)
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_PATH, 'report_products.png'),
+            dpi=150, bbox_inches='tight')
+plt.close()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 5 — BUILD PDF
+# ═══════════════════════════════════════════════════════════════
+print("Building PDF...")
+
+def set_font(pdf, style='', size=10, color=BLACK):
+    pdf.set_font('Arial', style, size)
+    pdf.set_text_color(*color)
+
+def draw_kpi(pdf, x, y, w, h, label, value, change, up):
+    pdf.set_fill_color(*LGREY)
+    pdf.rect(x, y, w, h, 'F')
+    pdf.set_xy(x, y + 2)
+    set_font(pdf, '', 8, DGREY)
+    pdf.cell(w, 5, label, align='C')
+    pdf.set_xy(x, y + 8)
+    set_font(pdf, 'B', 13, NAVY)
+    pdf.cell(w, 7, value, align='C')
+    prefix = '+' if up else '-'
+    color  = GREEN if up else RED
+    pdf.set_xy(x, y + 16)
+    set_font(pdf, 'B', 8, color)
+    pdf.cell(w, 5, f"{prefix} {change}", align='C')
+
+def pct(new, old):
+    return f"{abs((new - old) / old * 100):.1f}%"
+
+def safe_str(val):
+    return (val.encode('latin-1', errors='replace')
+               .decode('latin-1'))
+
+kpis = [
+    ("Total Revenue",
+     safe_str(f"£{last_week['Revenue']:,.0f}"),
+     pct(last_week['Revenue'], prev_week['Revenue']),
+     last_week['Revenue'] > prev_week['Revenue']),
+    ("Orders",
+     safe_str(f"{int(last_week['Orders']):,}"),
+     pct(last_week['Orders'], prev_week['Orders']),
+     last_week['Orders'] > prev_week['Orders']),
+    ("Customers",
+     safe_str(f"{int(last_week['Customers']):,}"),
+     pct(last_week['Customers'], prev_week['Customers']),
+     last_week['Customers'] > prev_week['Customers']),
+    ("Avg Order Value",
+     safe_str(f"£{last_week['AOV']:,.0f}"),
+     pct(last_week['AOV'], prev_week['AOV']),
+     last_week['AOV'] > prev_week['AOV']),
+]
+
+rev_direction = "up" if last_week['Revenue'] > prev_week['Revenue'] else "down"
+ord_direction = "up" if last_week['Orders']  > prev_week['Orders']  else "down"
+aov_direction = "up" if last_week['AOV']     > prev_week['AOV']     else "down"
+
+summary = safe_str(
+    f"SUMMARY: In {last_week['YearWeek']}, total revenue was "
+    f"£{last_week['Revenue']:,.0f}, {rev_direction} "
+    f"{pct(last_week['Revenue'], prev_week['Revenue'])} week on week. "
+    f"Orders were {ord_direction} "
+    f"{pct(last_week['Orders'], prev_week['Orders'])} "
+    f"at {int(last_week['Orders']):,}, with "
+    f"{int(last_week['Customers']):,} unique customers. "
+    f"Average order value was {aov_direction} "
+    f"{pct(last_week['AOV'], prev_week['AOV'])} at "
+    f"£{last_week['AOV']:,.0f}. "
+    f"The 8-week forecast projects average weekly revenue "
+    f"of £{forecast_avg:,.0f}."
+)
+
+pdf = FPDF()
+pdf.set_auto_page_break(auto=True, margin=15)
+pdf.add_page()
+pdf.set_margins(15, 15, 15)
+
+# Header
+pdf.set_fill_color(*NAVY)
+pdf.rect(0, 0, 210, 28, 'F')
+pdf.set_xy(15, 6)
+set_font(pdf, 'B', 16, WHITE)
+pdf.cell(0, 8, 'Weekly Sales Performance Report', ln=True)
+pdf.set_xy(15, 15)
+set_font(pdf, '', 9, (180, 200, 220))
+pdf.cell(0, 6,
+    f"Reporting Week: {last_week['YearWeek']}  |  "
+    f"Generated: {datetime.now().strftime('%d %b %Y')}  |  "
+    f"Data: Online Retail II (UCI)  |  "
+    f"Period: Dec 2009 - Nov 2011")
+
+# KPI strip
+pdf.set_xy(15, 30)
+set_font(pdf, 'B', 10, NAVY)
+pdf.cell(0, 6, 'KEY METRICS - WEEK ON WEEK', ln=True)
+kpi_x = 15
+kpi_y = 37
+kpi_w = 42
+kpi_h = 24
+kpi_gap = 3
+for i, (label, value, change, up) in enumerate(kpis):
+    draw_kpi(pdf, kpi_x + i * (kpi_w + kpi_gap),
+             kpi_y, kpi_w, kpi_h, label, value, change, up)
+
+# KPI caption
+pdf.set_xy(15, 63)
+set_font(pdf, 'I', 8, DGREY)
+pdf.cell(0, 5,
+    'All metrics show the most recent complete week '
+    f"({last_week['YearWeek']}) vs the prior week "
+    f"({prev_week['YearWeek']}). Revenue and AOV are total for that week.")
+
+# Summary box
+pdf.set_fill_color(230, 240, 255)
+pdf.rect(15, 70, 180, 16, 'F')
+pdf.set_xy(17, 72)
+set_font(pdf, '', 8, NAVY)
+pdf.multi_cell(176, 5, summary)
+
+# Revenue trend
+pdf.set_xy(15, 90)
+set_font(pdf, 'B', 10, NAVY)
+pdf.cell(0, 5, 'REVENUE TREND', ln=True)
+pdf.set_xy(15, 96)
+set_font(pdf, 'I', 8, DGREY)
+pdf.cell(0, 5,
+    'Weekly total revenue over the last 26 weeks. '
+    'Red dashed line shows 4-week rolling average to smooth short-term noise.')
+pdf.image(os.path.join(OUTPUT_PATH, 'report_revenue.png'),
+          x=15, y=102, w=180)
+
+# Forecast
+pdf.set_xy(15, 163)
+set_font(pdf, 'B', 10, NAVY)
+pdf.cell(0, 5, '8-WEEK FORECAST', ln=True)
+pdf.set_xy(15, 169)
+set_font(pdf, 'I', 8, DGREY)
+pdf.cell(0, 5,
+    'Projected weekly revenue for the next 8 weeks using Exponential Smoothing. '
+    'Each bar = one full week of forecasted revenue.')
+pdf.image(os.path.join(OUTPUT_PATH, 'report_forecast.png'),
+          x=15, y=175, w=180)
+
+# Page 2
+pdf.add_page()
+
+# Top products
+pdf.set_xy(15, 15)
+set_font(pdf, 'B', 10, NAVY)
+pdf.cell(0, 5, 'TOP 10 PRODUCTS BY REVENUE', ln=True)
+pdf.set_xy(15, 21)
+set_font(pdf, 'I', 8, DGREY)
+pdf.cell(0, 5,
+    'Total revenue per product across the full dataset (Dec 2009 - Nov 2011). '
+    'Units sold and avg price shown in the table below.')
+pdf.image(os.path.join(OUTPUT_PATH, 'report_products.png'),
+          x=15, y=27, w=180)
+
+# Product table
+pdf.set_fill_color(*NAVY)
+pdf.set_xy(15, 95)
+set_font(pdf, 'B', 8, WHITE)
+pdf.cell(80, 7, 'Product',    fill=True, border=0)
+pdf.cell(30, 7, 'Revenue',    align='R', fill=True, border=0)
+pdf.cell(25, 7, 'Units Sold', align='R', fill=True, border=0)
+pdf.cell(25, 7, 'Avg Price',  align='R', fill=True, border=0)
+pdf.ln()
+for i, row in top_products.head(10).iterrows():
+    bg = LGREY if i % 2 == 0 else WHITE
+    pdf.set_fill_color(*bg)
+    desc = str(row['Description'])[:38] \
+           if isinstance(row['Description'], str) else 'Unknown'
+    set_font(pdf, '', 8, BLACK)
+    pdf.cell(80, 6, desc,                          fill=True, border=0)
+    pdf.cell(30, 6, f"£{row['Revenue']:,.0f}",
+             align='R', fill=True, border=0)
+    pdf.cell(25, 6, f"{int(row['Units_Sold']):,}",
+             align='R', fill=True, border=0)
+    pdf.cell(25, 6, f"£{row['Avg_Price']:,.2f}",
+             align='R', fill=True, border=0)
+    pdf.ln()
+
+# Countries table
+pdf.set_xy(15, 168)
+set_font(pdf, 'B', 10, NAVY)
+pdf.cell(0, 5, 'TOP 10 COUNTRIES (EX UK)', ln=True)
+pdf.set_xy(15, 174)
+set_font(pdf, 'I', 8, DGREY)
+pdf.cell(0, 5,
+    'Total revenue by country across full dataset, excluding United Kingdom '
+    '(83% of revenue). Remaining 17% shown here.')
+pdf.set_fill_color(*NAVY)
+pdf.set_xy(15, 180)
+set_font(pdf, 'B', 8, WHITE)
+pdf.cell(80, 7, 'Country', fill=True, border=0)
+pdf.cell(40, 7, 'Revenue', align='R', fill=True, border=0)
+pdf.ln()
+for i, row in top_countries_ex_uk.head(10).iterrows():
+    bg = LGREY if i % 2 == 0 else WHITE
+    pdf.set_fill_color(*bg)
+    set_font(pdf, '', 8, BLACK)
+    pdf.cell(80, 6, row['Country'], fill=True, border=0)
+    pdf.cell(40, 6, f"£{row['Revenue']:,.0f}",
+             align='R', fill=True, border=0)
+    pdf.ln()
+
+# Footer
+pdf.set_y(-20)
+pdf.set_fill_color(*NAVY)
+pdf.rect(0, pdf.get_y(), 210, 20, 'F')
+pdf.set_xy(15, pdf.get_y() + 6)
+set_font(pdf, '', 8, (180, 200, 220))
+pdf.cell(0, 6,
+    f'Generated automatically | '
+    f'Data: Online Retail II (UCI) | '
+    f'{datetime.now().strftime("%d %b %Y %H:%M")}')
+
+# Save
+report_name = f"weekly_report_{last_week['YearWeek'].replace('-', '_')}.pdf"
+full_path   = os.path.join(OUTPUT_PATH, report_name)
+pdf.output(full_path)
+print(f"Report saved: {full_path}")
+
