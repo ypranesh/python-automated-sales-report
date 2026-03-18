@@ -178,4 +178,4 @@ Prophet (Facebook) was evaluated as the primary forecasting library for its auto
 
 ---
 
-*[Your Name] | [LinkedIn URL] | [Portfolio URL]*
+Pranesh Yuvaraj | linkedin.com/in/pranesh-yuvaraj
